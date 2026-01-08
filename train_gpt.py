@@ -15,6 +15,12 @@ from itertools import accumulate
 from pathlib import Path
 import gc
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
@@ -1818,6 +1824,8 @@ class Hyperparameters:
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
+    use_wandb: bool = True  # enable wandb logging
+    wandb_project: str = "modded-nanogpt"  # wandb project name
     # attention masking
     block_size: int = 128
     ws_schedule: tuple = (3, 7, 11)
@@ -1844,17 +1852,59 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
 logfile = None
+use_wandb = False
 if master_process:
     run_id = args.run_id
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
+    # initialize wandb
+    if args.use_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            project=args.wandb_project,
+            name=run_id,
+            config={
+                "num_iterations": args.num_iterations,
+                "num_scheduled_iterations": args.num_scheduled_iterations,
+                "cooldown_frac": args.cooldown_frac,
+                "train_bs_schedule": args.train_bs_schedule,
+                "train_max_seq_len": args.train_max_seq_len,
+                "ws_schedule": args.ws_schedule,
+                "ws_final": args.ws_final,
+                "world_size": world_size,
+                "grad_accum_steps": grad_accum_steps,
+            }
+        )
+        use_wandb = True
+    elif args.use_wandb and not WANDB_AVAILABLE:
+        print("Warning: wandb requested but not installed. Install with: pip install wandb")
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
             if console:
                 print(s)
             print(s, file=f)
+
+# NOTE: compute_grad_norms disabled - causes torch.compile issues when accessing
+# model parameters during training. Could be re-enabled with torch.compiler.disable()
+# decorator or by moving the computation outside the compiled region.
+# def compute_grad_norms(model):
+#     """Compute gradient norms for different parameter groups."""
+#     grad_norms = {}
+#     total_norm_sq = 0.0
+#     for name, param in model.named_parameters():
+#         if param.grad is not None:
+#             param_norm = param.grad.data.float().norm().item()
+#             label = getattr(param, 'label', 'unknown')
+#             if label not in grad_norms:
+#                 grad_norms[label] = 0.0
+#             grad_norms[label] += param_norm ** 2
+#             total_norm_sq += param_norm ** 2
+#     # Convert to actual norms
+#     for label in grad_norms:
+#         grad_norms[label] = grad_norms[label] ** 0.5
+#     grad_norms['total'] = total_norm_sq ** 0.5
+#     return grad_norms
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -1961,6 +2011,13 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        # wandb logging for validation
+        if use_wandb:
+            wandb.log({
+                "val_loss": val_loss.item() if hasattr(val_loss, 'item') else val_loss,
+                "train_time_ms": training_time_ms,
+                "step_avg_ms": training_time_ms / max(step, 1),
+            }, step=step)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1982,12 +2039,33 @@ for step in range(train_steps + 1):
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
         (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+
     training_manager.step_optimizers(step)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
+    # wandb logging for training metrics (grad norms disabled due to torch.compile issues)
+    if use_wandb and step % 10 == 0:
+        lr = get_lr(step)
+        bs = get_bs(step)
+        ws_short, ws_long = get_ws(step)
+        momentum = get_muon_momentum(step)
+        log_dict = {
+            "lr": lr,
+            "batch_size": bs,
+            "ws_short": ws_short,
+            "ws_long": ws_long,
+            "muon_momentum": momentum,
+        }
+        wandb.log(log_dict, step=step)
+
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+
+# finish wandb run
+if use_wandb:
+    wandb.finish()
+
 dist.destroy_process_group()
